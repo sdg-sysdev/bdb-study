@@ -1,0 +1,215 @@
+BDB REGION
+如果ENV是private的(F_ISSET(env, ENV_PRIVATE))，则通过os_malloc分配空间，否则在共享内存里面分配空间
+
+
+lock_util.c -----------------------------------------------------------------------------------------------------
+u_int32_t __lock_ohash(const DBT *dbt)			计算DBT的hash
+u_int32_t __lock_lhash(DB_LOCKOBJ *lock_obj)	计算LOCKOBJ的hash
+
+	如果目标对象是DB_LOCK_ILOCK，则使用FAST_HASH
+
+
+lock_timer.c ----------------------------------------------------------------------------------------------------
+// 在共享内存中设置超时
+// 事务子系统会调用该函数。并总是将timeout设置为当前事务的过期时间或当前事务的一个锁被允许等待的时间。
+int __lock_set_timeout(ENV *env, DB_LOCKER *locker, db_timeout_t timeout, u_uint32_t op)
+
+	获取lock region lock并调用__lock_set_timeout_internal
+
+// 被lock子系统所调用的内部版本
+int __lock_set_timeout_internal(ENV *env, DB_LOCKER *sh_locker, db_timeout_t timeout, u_int32_top)
+
+	DB_LOCKREGION *region = env->lk_handle->reginfo.primary;
+
+	op == DB_SET_TXN_TIMEOUT: 设置sh_locker->tx_expire为 NOW + timeout
+	op == DB_SET_LOCK_TIMEOUT: 设置sh_locker->lk_timeout为timeout，以及DB_LOCKER_TIMEOUT标志
+	op == DB_SET_TXN_NOW时
+		将sh_locker->tx_expire和sh_locker->lk_expire设置为NOW
+		如果sh_locker->next_time还没有设置或者大于NOW，则被设置为NOW
+
+
+// 从parent locker那儿继承timeout
+// 事务子系统会调用该函数。如果parent locker不存在，或者还没有设置当前事务的timeout，则返回EINVAL
+int __lock_inherit_timeout(ENV *env, DB_LOCKER *parent, DB_LOCKER *locker)
+
+
+lock_stat.c -----------------------------------------------------------------------------------------------------
+
+int __lock_stat_pp(DB_ENV *dbenv, DB_LOCK_STAT **statp, u_int32_t flags) 	ENV->lock_stat pre/post processing
+
+static int __lock_stat(DB_ENV *dbenv, DB_LOCK_STAT **statp, u_int32_t flags)	供__lock_stat_pp调用
+
+int __lock_stat_print_pp(DB_ENV *dbenv, u_int32_t flags)		ENV->lock_stat_print pre/post processing
+
+int __lock_stat_print(ENV *env, u_int32_t flags)		ENV->lock_stat_print method
+
+static int __lock_print_stats(ENV *env, u_int32_t flags)	打印缺省的lock region统计信息，供__lock_stat_print调用
+
+static int __lock_print_all(ENV *env, u_int32_t flags)	打印lock region的调试信息，供__lock_stat_print调用
+
+......
+
+lock_region.c ---------------------------------------------------------------------------------------------------
+int __lock_open(ENV *env)	lock_open函数的内部版本
+
+	DB_ENV *dbenv = env->dbenv;
+
+	分配DB_LOCKTAB结构并设置lt->env = env
+
+	调用__env_region_share(env, &lt->reginfo)共享primary region
+
+	如果需要创建lock region(F_ISSET(&lt->reginfo, REGION_CREATE)), 则调用__lock_region_init分配并初始化它
+
+	设置lt->reginfo.primary指向DB_LOCKREGION(新建的或原有的)
+
+	设置DB_LOCKTAB中相关的指针(conflicts, part_array, obj_stat, obj_tab, locker_tab)
+
+	获取DB_LOCKREGION的锁(mtx_region)
+
+	根据环境配置，设置lock region的deadlock detector运行方式, lock timeout以及transaction timeout
+
+	释放DB_LOCKREGION的锁(mtx_region)
+
+
+static int __lock_region_init(ENV *env, DB_LOCKTAB *lt)		初始化lock region
+
+	DB_ENV *dbenv = env->dbenv;
+
+	为lock region分配空间并初始化 
+
+	DB_LOCKREGION *region = lt->region.primary;
+
+	region->mtx_region = REGENV.mtx_regenv;	// 由于lock region是共享的，因此使用环境的mutex
+
+	初始化简单成员变量和stat
+
+	为conflict matrix分配空间并初始化 (region->conf_off)
+
+	为lock object hash table 分配空间并初始化 (region->obj_off)
+
+	为lock object hash table的统计数组分配空间并初始化 (region->stat_off)	// #ifdef HAVE_STATISTICS
+
+	为lock partition数组分配空间并初始化 (region->part_off)
+
+	为所有lock partition中的mtx_part分配空间并初始化
+
+	为lock region的mtx_dd, mtx_lockers分配空间并初始化
+
+	为locker hash table分配空间并初始化 (region->locker_off)
+
+	为每个lock partition负责的locks(part->lock_mem_off)和lockobjs(part->lockobj_mem_off)分配空间，
+	并加入到相应的free list(part->free_locks, part->free_objs)中。
+	locks和lockobjs会被平均分配到所有的lock partition中，其总量分别为为dbenv->lk_init和dbenv->lk_init_objects。
+
+	为所有的lockers(dbenv->lk_init_lockers)分配空间(region->locker_mem_off)，并加入到free list(region->free_lockers)中。
+
+
+int __lock_env_refresh(ENV *env)	在close lock system或failed open时做必要的清除工作
+
+	DB_LOCKTAB *lt = env->lk_handle;
+	REGINFO *reginfo = &lt->reginfo;
+	DB_LOCKTAB *lt = reginfo->primary;
+	
+	如果是private环境，则调用__env_alloc_free释放conflict matrix(lr->conf_off), lock object hash table(lr->obj_off), 
+	locker hash table(lr->locker_off), lock object hash table的统计数组(lr->stat_off), 
+	所有lock partition中的lock和lock objects, lock partition数组(lr->part_off)，lockers数组(lr->locker_mem_off)
+	占用的空间
+
+	从region detach(__env_region_detach(env, reginfo, 0))
+
+	丢弃DB_LOCKTAB(__os_free, env->lk_handle = NULL)
+
+
+u_int32_t __lock_region_mutex_count(ENV *env)		返回lock region需要的mutex数目
+
+	DB_ENV *dbenv = env->dbenv;
+
+	返回 dbenv->lk_init_lockers + dbenv->lk_partitions + 3 
+	     (1 mutex per lock, 1 mutex per lock partition, mtx_region/mtx_dd/mtx_lockers in lock region)
+
+
+u_int32_t __lock_region_mutex_max(ENV *env)		返回lock region额外所需要的mutex数目
+	
+	DB_ENV *dbenv = env->dbenv;
+
+	返回dbenv->lk_max_lockers - dbenv->lk_init_lockers，
+	如果dbenv->lk_max_lockers为0，则使用DB_LOCK_DEFAULT_N
+
+
+size_t __lock_region_max(ENV *env)		返回lock region额外所需要分配的额外内存数量
+
+	DB_ENV *dbenv = env->dbenv;
+
+	返回 dbenv->lk_max - dbenv->lk_init个locks, dbenv->lk_max_objects - dbenv->lk_init_objects个lock object,
+	     dbenv->lk_max_lockers - lk_init_lockers个lockers所需要的空间，再加上该空间的1/4
+	     (如果lk_max...为0，则使用DB_LOCK_DEFAULT_N, 另外使用__env_alloc_size来计算对象需要的空间)
+
+
+size_t __lock_region_size(ENV *env, size_t other_alloc)		返回lock region的初始大小
+	
+	具体实现看代码。原则是针对__lock_region_init中的每次__env_alloc调用都有对应的计算大小代码。
+
+
+lock_method.c ---------------------------------------------------------------------------------------------------
+int __lock_env_create(DB_ENV *dbenv)	初始化DB_ENV结构中Lock相关的成员变量
+	
+	设置lk_init, lk_init_lockers和lk_init_objects为0
+
+	设置lk_partitions为1(单CPU)或者10 * CPUNUM(多CPU)
+
+
+void __lock_env_destroy(DB_ENV *dbenv)	摧毁DB_ENV结构中Lock相关的成员变量
+
+	如果lk_conflicts不为空，则调用__os_free函数释放
+
+
+// !!! 以下的__lock_get_xxx/__lock_set_xxx函数中，如果已经配置了locking子系统
+// !!! (LOCKING_ON(ENV *))，则获取/设置DB_LOCKTAB及DB_LOCKREGION中的相关信息，
+// !!! 否则获取/设置DB_ENV中的相关信息
+// !!! __lock_set_xxx如果不作特别说明，则只能在调用DB_ENV->open之前设置
+
+
+// 获取/设置conflicts matrix信息
+int __lock_get_lk_conflicts(DB_ENV *dbenv, const u_int8_t **lk_conflictsp, int *lk_modesp)
+int __lock_set_lk_conflicts(DB_ENV *dbenv, u_int8_t *lk_conflicts, int lk_modes)		
+
+// 获取/设置deadlock detector运行方式
+// 已经配置了locking子系统的情况下，只有在原先为DB_LOCK_NORUN的情况下才会实际设置
+int __lock_get_lk_detect(DB_ENV *dbenv, u_int32_t *lk_detectp)
+int __lock_set_lk_detect(DB_ENV *dbenv, u_int32_t lk_detect)
+
+// 获取/设置最大lock数目
+int __lock_get_lk_max_locks(DB_ENV *dbenv, u_int32_t *lk_maxp)
+int __lock_set_lk_max_locks(DB_ENV *dbenv, u_int32_t lk_max)
+
+// 获取/设置最大locker数目
+int __lock_get_lk_max_lockers(DB_ENV *dbenv, u_int32_t *lk_maxp)
+int __lock_set_lk_max_lockers(DB_ENV *dbenv, u_int32_t lk_max)
+
+// 获取/设置最大lock object数目
+int __lock_get_lk_max_objects(DB_ENV *dbenv, u_int32_t *lk_maxp)
+int __lock_set_lk_max_objects(DB_ENV *dbenv, u_int32_t lk_max)
+
+// 获取/设置lock partition数目
+int __lock_get_lk_partitions(DB_ENV *dbenv, u_int32_t *lk_partitionp)
+int __lock_set_lk_partitions(DB_ENV *dbenv, u_int32_t lk_partitions)
+
+// 获取/设置lock object hash table size
+int __lock_get_lk_tablesize(DB_ENV *dbenv, u_int32_t *lk_tablesizep)
+int __lock_set_lk_tablesize(DB_ENV *dbenv, u_int32_t lk_tablesize)
+
+// 获取/设置某个locker的priority
+// 只有在配置了locking子系统之后才能调用
+int __lock_get_lk_priority(DB_ENV *dbenv, u_int32_t lockid, u_int32_t *priorityp)
+int __lock_set_lk_priority(DB_ENV *dbenv, u_int32_t lockid, u_int32_t priority)
+
+// 获取/设置事务超时(flag == DB_SET_TXN_TIMEOUT)或者lock超时(flag == DB_SET_LOCK_TIMEOUT)
+// 调用DB_ENV->open之后也能设置
+int __lock_get_env_timeout(DB_ENV *dbenv, db_timeout_t *timeoutp, u_int32_t flag)
+int __lock_set_env_timeout(DB_ENV *dbenv, db_timeout_t timeout, u_int32_t flags)
+
+
+lock_list.c -----------------------------------------------------------------------------------------------------
+int __lock_fix_list(ENV *env, DBT *list_dbt, u_int32_t nlocks)
+
+
