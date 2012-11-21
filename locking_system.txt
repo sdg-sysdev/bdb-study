@@ -210,6 +210,883 @@ int __lock_set_env_timeout(DB_ENV *dbenv, db_timeout_t timeout, u_int32_t flags)
 
 
 lock_list.c -----------------------------------------------------------------------------------------------------
+// lock list的数据结构如下:
+// LIST = COUNT32 LOCK*					// COUNT32 is lock count
+// LOCK = COUNT16 LOCKOBJ PAGELIST		// COUNT16 is page list count
+// LOCKOBJ = COUNT16 OBJ 				// COUNT16 is OBJ data size
+// PAGELIST = COUNT32*					// COUNT32 is page no.
+
+
+// 将list_dbt中的locks按照type和fileid分组，同时将看起来不是page lock的locks(size != sizeof(DB_LOCK_ILOCK))移到最后
+// 成功返回时 list_dbt->data为lock list数据结构
 int __lock_fix_list(ENV *env, DBT *list_dbt, u_int32_t nlocks)
+
+	DBT *obj = (DBT *)list_db->data;
+
+	如果nlocks == 1，则直接分配内存并组装数据
+
+	否则先使用quick sort进行排序，比较函数为__lock_sort_cmp。
+	__lock_sort_cmp实现为首先按照是否为page lock，然后按照lock type，最后按照fileid进行比较。
+	然后合并相同type和fileid的locks，最后分配内存并组装数据。
+
+
+// 为某个locker获取指定的list of locks(通过调用__lock_get_internal)
+// list->data为lock list数据结构
+int __lock_get_list(ENV *env, DB_LOCKER *locker, u_int32_t flags, db_lockmode_t lock_mode, DBT *list)
+
+
+// 将lock list信息打印到DB_MSGBUF中
+// list->data为lock list数据结构
+void __lock_list_print(ENV *env, DB_MSGBUF *mbp, DBT *list)
+
+
+lock_id.c -------------------------------------------------------------------------------------------------------
+// ENV->lock_id pre/post processing
+int __lock_id_pp(DB_ENV *dbenv, u_int32_t *idp)
+
+// ENV->lock_id
+int __lock_id(ENV *env, u_int32_t *idp, DB_LOCKER **lkp)
+
+	DB_LOCKTAB *lt = env->lk_handle;
+	DB_LOCKREGION *region = lt->reginfo.primary;
+
+	LOCK_LOCKERS(env, region);	// region->mtx_lockers
+
+	// region->lockers表示使用中的lockers list，entry link为DB_LOCKER.ulinks
+	// 整个id空间为(DB_LOCK_INVALIDID, DB_LOCK_MAXID]
+	// (region->lock_id, region->cur_maxid]为空闲id区间，可以用于为locker分配id
+	// 由于存在折返的情况，因此有可能region->lock_id > region->cur_maxid
+
+	如果region->lock_id == DB_LOCK_MAXID && region->cur_maxid != DB_LOCK_MAXID，
+	则设置region->lock_id = DB_LOCK_INVALIDID;
+
+	如果当前空闲id区间分配完了(region->lock_id == region->cur_maxid)，则
+	调用__db_idspace函数找出另一个具有最大gap的空闲id空间
+
+	id = ++region->lock_id;
+
+	调用__lock_getlocker_int(lt, id, 1, &lk)为该id分配一个DB_LOCKER对象
+
+	UNLOCK_LOCKERS(env, region);
+
+
+// 为locker设置pid和tid
+// lref_arg实际类型为DB_LOCKER *
+void __lock_set_thread_id(void *lref_arg, pid_t pid, db_threadid_t tid)
+
+
+// ENV->lock_id_free pre/post processing
+int __lock_id_free_pp(DB_ENV *dbenv, u_int32_t id)
+
+	DB_LOCKTAB *lt = env->lk_handle;
+	DB_LOCKREGION *region = lt->reginfo.primary;
+
+	LOCK_LOCKERS(env, region);
+
+	调用__lock_getlocker_int(lt, id, 0, &sh_locker)函数获取该id对应的locker，
+	然后调用__lock_freelocker_int(lt, region, sh_locker, 1)函数释放该locker
+
+	UNLOCK_LOCKERS(env, region);
+
+
+// 释放一个locker id
+int __lock_id_free(ENV *env, DB_LOCKER *sh_locker)
+
+	DB_LOCKTAB *lt = env->lk_handle;
+	DB_LOCKREGION *region = lt->reginfo.primary;
+
+	如果sh_locker拥有的lock不为0，则返回EINVAL
+
+	LOCK_LOCKERS(env, region);
+	调用__lock_freelocker_int(lt, region, sh_locker, 1)释放该locker
+	UNLOCK_LOCKERS(env, region);
+
+
+// 设置当前locker id和当前最大空闲id(for testing purposes only)
+int __lock_id_set(ENV *env, u_int32_t cur_id, u_int32_t max_id)
+
+
+// 获取id对应的locker对象，create参数指示当locker对象不存在时是否需要创建 
+int __lock_getlocker(DB_LOCKTAB *lt, u_int32_t locker, int create, DB_LOCKER **retp)
+
+	LOCK_LOCKERS(env, region);
+	ret = __lock_getlocker_int(lt, locker, create, retp);
+	UNLOCK_LOCKERS(env, region);
+
+
+// __lock_getlocker函数的内部版本
+// 调用该函数之前需要先LOCK_LOCKERS
+int __lock_getlocker_int(DB_LOCKTAB *lt, u_int32_t locker, int create, DB_LOCKER **retp)
+
+	DB_LOCKREGION *region = lt->reginfo.primary;
+
+	// locker hash table所用的hash函数直接就是 locker_id % region->locker_t_size
+	在locker hash table (lt->locker_tab)中查找对应的locker对象，如果找到则返回
+
+	如果没有找到对应的locker对象且create参数步为0，则继续执行以下步骤
+
+	调用__mutex_alloc函数分配一个mutex并加锁
+
+	如果free list(region->free_lockers)上没有更多的locker对象，
+	则新分配region->stat.st_lockers >> 2个locker对象并加入到free list中
+
+	通过SH_TAILQ_REMOVE宏获取free list上的一个locker对象，并初始化该对象
+	(sh_locker->mtx_locker设置为之前分配的mutex(处于锁定状态))
+
+
+// 将一个子事务locker加入到家庭中
+int __lock_addfamilylocker(ENV *env, u_int32_t pid, u_int32_t id, u_int32_t is_family)
+
+	DB_LOCKTAB *lt = env->lk_handle;
+	DB_LOCKREGION *region = lt->reginfo.primary;
+	LOCK_LOCKERS(env, region);
+
+	调用__lock_getlocker_int获取/创建parent locker(根据pid)
+
+	调用__lock_getlocker_int获取/创建child locker(根据id)
+
+	设置parent/child locker之间的父子关系(DB_LOCKER.parent_locker)
+
+	设置child locker的master_locker成员指向master locker
+	// master locker对应的事务为最外层的那个事务
+
+	将该child locker加到master locker的child locker list(DB_LOCKER.child_locker)最前面
+	// 加到最前面的原因是当死锁时，很可能是由于最后创建的那个child loker被block所导致的
+
+
+// 删除一个locker，调用之前必须LOCK_LOCKERS
+static int __lock_freelocker_int(DB_LOCKTAB *lt, DB_LOCKREGION *region, DB_LOCKER *sh_locker, int reallyfree)
+
+	如果该locker是一个locker家庭的一员，则将它从master locker的child locker list中移除，
+	并清除该locker的master_locker成员
+	(不用清除和parent locker之间的关系吗???)
+
+	如果reallyfree不为0，则释放该locker，具体包括将它从locker hash table(lt->locker_tab)中移除，释放
+	mtx_locker mutext，插入到free list中，从in use list(region->lockers)中移除，region->nlockers--，
+	并更新stat信息
+
+
+// 删除一个locker，调用之前不能LOCK_LOCKERS
+int __lock_freelocker(DB_LOCKTAB *lt, DB_LOCKER *sh_locker)
+
+	LOCK_LOCKERS(env, region);
+	ret = __lock_freelocker_int(lt, region, sh_locker, 1);
+	UNLOCK_LOCKERS(env, region);
+
+
+// 将一个locker从其家庭中移除，调用之前不能LOCK_LOCKERS
+int __lock_familyremove(DB_LOCKTAB *lt, DB_LOCKER *sh_locker)
+
+	LOCK_LOCKERS(env, region);
+	ret = __lock_freelocker_int(lt, region, sh_locker, 0);
+	UNLOCK_LOCKERS(env, region);
+
+	
+lock.c ----------------------------------------------------------------------------------------------------------
+object 			底层对象信息，DB_LOCK_ILOCK
+lock object 	对底层对象的一个封装，添加了waiters, holders等等其它信息，DB_LOCKOBJ
+lock 			包含锁的相关信息，mtx_lock, holder等等，struct __db_lock
+locker 			加锁主体，例如transaction。
+lock partition  分区，以增加并发度
+lock region 	一个环境一个lock region
+lock request	DB_LOCK(struct __db_lock_u)，封装lock请求参数
+struct __db_lock.indx等于所对应的lock object的indx
+
+
+
+DB_LOCKOBJ.waiter contains __db_lock
+DB_LOCKER.heldby  contains __db_lock
+
+struct __db_lock { /* SHARED */
+	/*
+	 * Wait on mutex to wait on lock.  You reference your own mutex with
+	 * ID 0 and others reference your mutex with ID 1.
+	 */
+	db_mutex_t	mtx_lock;
+
+	roff_t		holder;		/* Who holds this lock. */
+	u_int32_t	gen;		/* Generation count. */
+	SH_TAILQ_ENTRY	links;		/* Free or holder/waiter list. */
+	SH_LIST_ENTRY	locker_links;	/* List of locks held by a locker. */	// DB_LOCKER.heldby
+	u_int32_t	refcount;	/* Reference count the lock. */
+	db_lockmode_t	mode;		/* What sort of lock. */
+	roff_t		obj;		/* Relative offset of object struct. */		// DB_LOCKOBJ 
+	u_int32_t	indx;		/* Hash index of this object. */
+	db_status_t	status;		/* Status of this lock. */
+};
+
+
+
+
+// 在指定的lock partition中分配一个lock
+static int __lock_alloclock(DB_LOCKTAB *lt, u_int32_t part_id)
+
+	设定相应的宏之后，include lock_alloc.incl文件
+
+
+// 释放一个lock。如果有必要的话去除它和locker之间的关联。
+// 调用之前必须获取lock对应的lock object的mutex
+static int __lock_freelock(DB_LOCKTAB *lt, struct __db_lock *lockp, 
+				DB_LOCKER *sh_locker, u_int32_t flags)
+
+	如果flags设置了DB_LOCK_UNLINK标志，则去除它和locker的关联
+	(DB_LOCKER.heldby, __db_lock.locker_links)，并更新locker
+	状态。
+
+	如果flags设置了DB_LOCK_FREE标志，则设置其状态为DB_LSTAT_FREE，并
+	将它放到lock partition的free list中去(DB_LOCKPARTITION.free_locks, struct __db_lock.links)。
+
+
+// 从object hash table中获取object。create参数表示是否在object不存在的情况下新建一个
+// 调用之前必须先获取object bucket的锁
+static int __lock_getobj(DB_LOCKTAB *lt, const DBT *obj, u_int32_t ndx, int create, DB_LOCKOBJ **retp)
+
+	遍历hash table bucket(lt->obj_tab[ndx])查找该对象(obj与DB_LOCKOBJ.lockobj, 比较size和data)
+
+	如果没有找到并且create != 0
+	{
+		// lock object与lock partition之间的对应关系是 lock object的hash table index % partition size
+		如果对应partition的free list中没有空闲的lock object，则调用__lock_allocobj分配对象，并
+		跳转到本函数起始处重新执行
+
+		如果创建中对象数据的大小小于等于lock objct(DB_LOCKOBJ)中预留的对象数据大小(obj->size <= sizeof(sh_obj->objdata))，
+		则直接使用DB_LOCKOBJ.objdata作为数据区，否则调用__env_alloc函数为对象数据分配空间
+
+		将对象数据复制到新的空间中(DB_LOCKOBJ.objdata或新分配的空间)
+
+		初始化新的lock object并将其加入到object hash table中(lt->obj_tab[ndx])
+	}
+
+	将找到的DB_LOCKOBJ对象设置到retp中并返回
+
+
+// 获取lock
+int __lock_get_pp(DB_ENV *dbenv, u_int32_t locker, u_int32_t flags, DBT *obj, db_lockmode_t lock_mode, DB_LOCK *lock)
+
+	执行相关的先期操作
+
+	调用__lock_get_api进行实际的操作	
+
+
+// 获取lock
+static int __lock_get_api(ENV *env, u_int32_t locker, u_int32_t flags, const DBT *obj, db_lockmode_t lock_mode, DB_LOCK *lock)
+
+	根据locker id获取locker对象
+
+	调用__lock_get_internal函数获取lock
+
+
+// 获取lock
+int __lock_get(ENV *env, DB_LOCKER *locker, u_int32_t flags, const DBT *obj, db_lockmode_t lock_mode, DB_LOCK *lock)
+
+	如果环境处于recovery阶段，并且flags没有设置DB_LOCK_IGNORE_REC，则直接返回
+
+	LOCK_SYSTEM_LOCK
+	调用__lock_get_internal函数获取lock
+	LOCK_SYSTEM_UNLOCK
+
+
+// 包含lock_get操作的所有实现细节
+// 可能的lock_get结果: GRANT UPGRADE HEAD/SECOND/TAIL
+int __lock_get_internal(DB_LOCKTAB *lt, DB_LOCKER *sh_locker, u_int32_t flags, 
+			const DBT *obj, db_lockmode_t lock_mode, db_timeout_t timeout, DB_LOCK *lock)
+
+	ENV *env = lt->env;
+	DB_LOCKREGION *region = lt->reginfo.primary;
+
+	获取目标lock object并锁定对应的lock partition(如果obj参数为NULL，则通过lock->off获取struct __db_lock指针，然后
+	通过struct __db_lock.obj获取lock objct，否则通过调用__lock_getobj来获取/创建lock object)
+
+	/*
+	 * 一般来说，如果新的lock和holders list以及waiters list中的lock都不冲突的话，就会被GRANT。
+	 * 在与waiters list中lock冲突的情况下不批准的原因是这么做可能会导致"饿死"(等待一个被读者频繁访问的
+	 * 对象的写者可能永远都没机会被GRANT)。但是这么做也有一个缺点，就是一个正在等待的读者可以阻止另一个
+	 * 读者升级成写者，这种情况并不少见。
+	 *
+	 * 上述的不冲突规则有两个例外情况。其一，如果该请求的locker已经hold了一个lock，并且新请求的lock与其它
+	 * holders所持有的lock没有冲突，那么会GRANT。最经常碰到这种情况的场合是一个locker已经持有了一个WRITE lock,
+	 * 然后它又发出了一个READ lock的请求。如果不GRANT该READ lock，则肯定会产生死锁。其二，脏读者在避免饿死的
+	 * 情况下会被尽量GRANT。
+	 *
+	 * 在冲突的情况下，新的lock会被放在waiters list的末尾。但如果是升级或者脏读者的情况下，lock会被放在
+	 * list的最前面或接近最前面的位置。
+	 */
+
+	 /*
+	  * 在使用queue访问方式，并希望获取一个超出queue末尾的entry时，会使用DB_LOCK_WAIT。在CDB的配置下，我们
+	  * 有了DB_READ_LOCK并且需要切换到DB_LOCK_WAIT。其它情况下，我们插入一个DB_LOCK_WAIT，在这之后释放等待它
+	  * 的元数据页面，并且合并waiters queue。为了避免发生其它locker在这时候进入并且无法唤醒我们的情况，
+	  * 上述操作必须作为一个原子操作进行，
+	  */
+
+	  遍历lock object的所有holders(DB_LOCKOBJ.holders, struct __db_lock)
+
+	  如果某个lock的holder就是当前请求者，并且lock mode相同，lock状态是已被held (sh_off == lp->holder &&
+	  lp->mode == lock_mode && lp->status = DB_LSTAT_HELD)，这种情况下如果flags设置了DB_LOCK_UPGRADE，
+	  则跳转到UPGRADE步骤继续执行，否则增加lock的引用计数(lp->refcount++)后返回(注意: 这种情况下不会增加
+	  locker上的lock hold计数(DB_LOCKER.nlocks, DB_LOCKER.nwrites))
+
+	  如果有某个lock的holder(DB_LOCKER)既不是当前请求者，也不和当前请求者同一家庭(__lock_same_family)，
+	  并且两个lock互相冲突，则设置action为HEAD(lock holder中有该请求者或者跟该请求者同一家庭的，或flags
+	  设置了DB_LOCK_UPGRADE标志，或lock_mode参数为DB_LOCK_READ_UNCOMMITTED)或TAIL(其它情况)。
+
+	  如果和holder list不冲突，则检查waiter list。如果不冲突，则action = GRANT。否则，在允许脏读并且lock_mode
+	  参数为DB_LOCK_READ_UNCOMMITTED的情况下，如果第一个waiter是write lock并且该lock的locker是和holder list中
+	  的read/wwrite lock的locker是同一个，则action = SECOND，否则action = GRANT。
+	  否则如果lock_mode参数为DB_LOCK_READ_UNCOMMITTED，则action = SECOND。否则action = TAIL。
+
+	  以下根据action的值进行实际的处理:
+
+	      如果是HEAD, TAIL或SECOND，如果flags设置了DB_LOCK_NOWAIT且lock_mode != DB_LOCK_WAIT，则返回
+	      DB_LOCK_NOTGRANTED。否则和下一步作同样的处理。/* FALLTHROUGH */
+
+	      如果是GRANT，则从lock对应的partition中获取一个空闲lock(从free list中或者调用__lock_alloclock)，
+	      并初始化，然后插入到locker的heldby list中。
+
+
+UPGRADE:  如果是UPGRADE，则设置lock的mode为lock_mode参数(lp->mode = lock_mode)。如果lock_mode != DB_LOCK_WAIT，
+	      则我们已经完成了所有工作，直接返回。否则，如果lock的状态为DB_LSTAT_WAITING，则将其从lock object的
+	      hold list中去除并调用__lock_freelock释放，然后返回。
+
+
+	  以下根据action的值进行进一步处理:
+
+	      如果是GRANT，则设置新lock的状态为DB_LSTAT_HELD，并插入到lock object的holder list中。
+	      
+	      如果是UPGRADE/HEAD/TAIL/SECOND，
+
+	          如果lock object的waiter list为空，则将该lock object加入到region->dd_objs中去。
+
+	          将新lock插入到waiter list中相应的位置去。
+
+	          如果对应的事务已经超时，则释放新lock并返回。
+
+	          设置新lock的其它状态(newl->status = DB_LSTAT_WAITING, newl->mtx_lock = sh_locker->mtx_locker)，
+	          设置需要运行dd(region->need_dd = 1)
+
+	          /* 这时候才unlock object保证了在__lock_promote访问时newl的status和mtx_lock都已经被正确设置 */
+	          OBJECT_UNLOCK(lt, region, sh_obj->indx);
+
+	          /* If we are switching drop the lock we had */
+
+	          如果需要运行dd，则调用__lock_detect
+
+	          调用__env_set_state函数设置当前线程的状态为THREAD_BLOCKED
+
+	          /*
+	           * 在__lock_getlocker_int中分配一个locker时，可以看到DB_LOCKER.mtx_locker是处于locked状态。
+	           * 因此，之后在该mutex之上的lock请求都会被阻塞。在__lock_promote函数中，在合适的情况下会
+	           * 通过调用MUTEX_UNLOCK，使得该操作可以进行下去
+	           *
+	           * newl->mtx_lock = sh_locker->mtx_locker。并且由于一个locker在任意时候只会阻塞在一个mutex
+	           * 上面，因此不会出现在MUTEX_UNLOCK的时候，被GRANT的MUTEX LOCK请求不确定的情况。
+	           *
+	           * 这里可能有个问题，如果__lock_promote在本线程调用MUTEX_LOCK之前调用了MUTEX_UNLOCK，或者在
+	           * MUTEX_LOCK执行中的某个特定点调用了MUTEX_UNLOCK，会不会产生问题???
+	           * 
+	           * 通过查看WIN32的MUTEX实现代码，这种情况下也不会产生问题。
+	           */
+	          调用MUTEX_LOCK(env, newl->mtx_lock);		// 该操作会阻塞!!!
+
+	          根据新lock状态做不同操作:
+
+	          	  /* 如果lock get操作和deadlock detector形成竞争，并且它错误地让当前事务再一次abort，则
+	          	   * 忽略该abort并且继续请求lock
+	          	   */
+	              如果是DB_LSTAT_ABORTED，如果对应的locker设置了DB_LOCKER_INABORT标志，则重新尝试获取该lock，
+	              否则返回DB_LOCK_DEADLOCK。
+
+				  如果是DB_LSTAT_EXPIRED，则调用__lock_put_internal函数put并释放该lock，然后返回DB_LOCK_NOTGRANTED。
+
+				  /* 注意: 如果是DB_LSTAT_PENDING，则已经有其它人将该lock加入到lock object的holder list中了 */
+				  如果是DB_LSTAT_PENDING，如果flags参数设置了DB_LOCK_UPGRADE，则将新lock从lock object的holder list
+				  中去除，然后跳转到之前的UPGRADE步骤继续执行。 否则将新lock的状态设为DB_LSTAT_HELD。
+
+				  如果是DB_LSTAT_FREE/DB_LSTAT_HELD/DB_LSTAT_WAITING，则表示系统内部出了问题，报错之后退出。
+
+
+      最后，将新锁的信息存放到lock参数中，并更新对应locker的nlocks和nwrites，然后返回。
+
+
+// 释放一个lock
+// 在调用之前必须hold对应的object lock
+static int __lock_put_internal(DB_LOCKTAB *lt, struct __db_lock *lockp, u_int32_t obj_ndx, u_int32_t flags)
+
+	如果lock已经不在某个list中(!OBJ_LINKS_VALID(lockp))，则调用__lock_freelock函数释放它(放到free list中)并返回
+
+	如果flags参数没有设置DB_LOCK_DOALL，并且其引用计数大于1，则直接减1后返回
+
+	如果该lock的状态不为DB_LSTAT_HELD或者DB_LSTAT_PENDING(则它应该处于对应lock object的waiter list中)，则调用
+	__lock_remove_waiter函数将它从waiter list中去除。否则，使用SH_TAILQ_REMOVE将它从holder list中去除。
+
+	如果flags参数设置了DB_LOCK_NOPROMOTE，则调用__lock_promote函数提升waiter list中的lock。
+
+	如果这时lock object的holder/waiter list上都为空了，则将lock object从object hash table中去除，然后加入到
+	free list中。
+
+	如果flags参数设置了DB_LOCK_UNLINK或DB_LOCK_FREE，则调用__lock_freelock函数释放
+
+	如果之前的步骤中改变了lock graph的状态，则设置region->need_dd
+
+
+
+// 根据lock object holder/waiter list的情况判断并提升那些符合条件的lock
+int __lock_promote(DB_LOCKTAB *lt, DB_LOCKOBJ *obj, int *state_changedp, u_int32_t flags)
+
+	/* 在决定是否提升lock的同时，我们也需要决定是否需要重新运行deadlock detector。在释放了lock，
+	 * 并且waiter list中有lock但没有任何lock被提升的情况下，其实来说我们并没有改变lock manager的状态。
+	 * 因此系统中很可能还是有死锁的情况，所以我们需要再次运行deadlock detector。然而，如果waiter list
+	 * 是空的，或者我们实际提升了某个lock，则没有必要再次立即运行它。
+	 */
+
+	按照顺序遍历lock object的waiter list，提升所有不和holder list中的lock冲突(相同locker或者locker family的lock都视为不冲突)
+	的lock，直到第一个有冲突的lock为止。
+
+	如果该lock object的waiter list之前有元素，但现在为空，则将该lock object从region->dd_objs中去除
+
+
+// 在子事务提交的时候被调用，用于合并子事务和父事务的locks
+static int __lock_inherit_locks(DB_LOCKTAB *lt, DB_LOCKER *sh_locker, u_int32_t flags)
+	
+	/* 当一个父事务有很多的子事务，并且这些子事务都锁定了相同的lock object。为了不致于使父事务
+	 * 拥有太多的不必要的对相同对象的锁，因此我们尝试将子事务的锁合并到父事务中
+	 */
+
+	遍历子事务的heldby list，如果父事务已经拥有了该lock(lock object相同且mode相同)，则合并lock的引用计数，
+	并将该lock移到free list中，否则将它移到父事务的heldby list中并更新相应字段(lp->holder, nlocks, nwrites)。
+	不论何种情况下，都调用__lock_promote函数来尝试提升某些lock
+
+
+// 判断两个locker是否兼容。共有两种模式:
+// 1. 如果两个locker属于一个family事务，并且它们有共同的根祖先(root)事务，则它们之间是兼容的
+// 2. 如果locker 1是locker 2的一个父亲，则它们是兼容的
+static int __lock_same_family(DB_LOCKTAB *lt, DB_LOCKER *sh_locker1, DB_LOCKER *sh_locker2)
+
+
+//  ENV->lock_put pre/post processing
+int __lock_put_pp(DB_ENV *dbenv, DB_LOCK *lock)
+
+	ENV_ENTER之后，在REPLICATION_WRAP中包装了对__lock_put函数的调用
+
+
+// 内部lock_put接口
+int __lock_put(ENV *env, DB_LOCK *lock)
+
+	调用LOCK_SYSTEM_LOCK之后调用__lock_put_nolock函数
+
+	如果需要运行deadlock detector，则调用__lock_detect函数
+
+
+// lock_put内部版本
+// 调用之前需要先LOCK_SYSTEM_LOCK
+static int __lock_put_nolock(ENV *env, DB_LOCK *lock, int *runp, u_int32_t flags)
+
+	调用OBJECT_LOCK_NDX之后，调用__lock_put_internal函数
+
+	如果dd方式不为DB_LOCK_NORUN，并且设置了region->need_dd或者region->next_timeout，则设置runp为1，
+	表示需要运行dd
+
+
+// downgrade locks。当前用于三个地方:
+//   1) 由CDB用于将write lock downgrade为iwrite lock
+//   2) 在open/create的最后downgrade write-handle locks to read-handle locks
+//   3) 为了支持脏读，将write lock downgrade to was_write lock
+int __lock_downgrade(ENV *env, DB_LOCK *lock, db_lockmode_t new_mode, u_int32_t flags)
+
+	将lock的mode设置为新的mode，找到对应的lock object并调用__lock_promote函数
+
+
+// waiter list上的任意lock之上都有一个等待中的进程。因此，我们不能将lock立即返回到free list中。
+// 替代的解决方案是，我们将lock从waiter list中去除，设置lock的status字段，然后将对应的进程唤醒，
+// 并让该进程将lock放到free list中
+// 调用之前必须hold object bucket mutex(其实是相应lock partition的mutex)
+static int __lock_remove_waiter(DB_LOCKTAB *lt, DB_LOCKOBJ *sh_obj, struct __db_lock *lockp, db_status_t status)
+
+	将lock从waiter list中去除，并设置status字段
+
+	如果对应lock object的waiter list为空了，则将lock object从region->dd_objs中去除
+
+	如果status参数为DB_LSTAT_WAITING，则调用MUTEX_UNLOCK(lt->env, lockp->mtx_lock)唤醒阻塞的进程
+
+
+// 改变lock对应的locker id。该函数被用于将file locks从一个事务locker id设置为一个long-lived locker id。
+// 调用该函数之前必须hold lock region mutex
+static int __lock_trade(ENV *env, DB_LOCK *lock, DB_LOCKER *new_locker)
+
+	调用__lock_freelock将lock从当前locker的heldby list中去除
+
+	加入到新locker的heldby list中并更新相关字段(这里不用更新lp->mutex_lock字段???)
+
+
+// 将一个lock object上的lock都转到另外一个lock object上。
+// 当我们为了转变handle lock而移动metadata page时会用到该函数。
+int __lock_change(ENV *env, DB_LOCK *old_lock, DB_LOCK *new_lock)
+
+	LOCK_SYSTEM_LOCK
+	MUTEX_LOCK_PARTITION	// old_part and new_part，注意lock order
+
+	将old lock object的waiter/holder list中的所有lock转到new object的waiter/holder list中(除了old_lp)
+
+	将old_lp重新放到old lock object的holder list中，然后调用__lock_put_internal函数，同时释放
+	old lock和old lock object
+
+
+// 在指定的lock partition中分配一个lock object
+static int __lock_allocobj(DB_LOCKTAB *lt, u_int32_t part_id)
+
+	设定相应的宏之后，include lock_alloc.incl文件
+
+
+// 在lock region中分配对象的模板函数，使用之前需要定义一下一些宏
+// 调用该函数时候的情况是：需要分配的对象必须在指定的partition里面，
+// 但是该partition里面的free list上面没有空闲对象了
+// 首先的方法是从其它partition的free list上面借对象，如果都没有，则
+// 分配新对象
+ * FREE_LIST_HEAD -- the name of the head of the free list.
+ * STRUCT_NAME -- the name of the structure in the free list.
+ * CURRENT_COUNT -- structure element for count of current objects.
+ * MAX_COUNT -- structure element for max of current objects.
+ * STEAL_NAME -- name of stat to track steals.
+ * STEAL_EVENT -- name of event to track steals.
+ lock_alloc.incl file 	// __lock_alloc的模板文件
+
+	遍历除了当前partition之外的其它partition，如果某个partition的free list中
+	还有空闲对象，则将该对象移动到指定partition的free list上面，然后返回
+
+	LOCK_REGION_LOCK(lt->env);
+	MUTEX_LOCK(lt->env, orig_p->mtx_part);
+
+	如果指定的lock partition中还是没有空闲对象，并且还可以分配更多的对象
+	(region->stat.MAX_COUNT == 0 || region->stat.CURRENT_COUNT < region->stat.MAX_COUNT)
+	{
+
+		计算新分配对象的数量(min(当前对象数量/4，最大对象数量-当前对象数量)
+
+		调用__env_alloc分配内存
+
+		从当前partition开始，将分配的对象挨个放到所有partition的free list中去
+	}
+
+	如果当前partition的free list上面有了空闲对象，则返回。否则，跳转到开头重新
+	执行。
+
+
+// ENV->lock_vec pre/post processing
+int __lock_vec_pp(DB_ENV *dbenv, u_int32_t lid, u_int32_t flags, DB_LOCKREQ *list, int nlist, DB_LOCKREQ **elistp)
+
+	调用ENV_ENTER，然后在宏REPLICATION_WRAP中包装对__lock_vec_api函数的调用
+
+
+static int __lock_vec_api(DB_ENV *dbenv, u_int32_t lid, u_int32_t flags, DB_LOCKREQ *list, int nlist, DB_LOCKREQ **elistp)sta	
+
+	调用__lock_getlocker函数，根据locker id (lid)获取对应的locker(DB_LOCKER *)
+
+	调用__lock_vec函数做实际的工作
+
+
+// ENV->lock_vec
+// 实际的vector lock实现。该函数一次性执行操作集合中的所有请求。另外，lock_vec也提供了lock继承，
+// 释放指定locker的所有locks(在事务提交/回滚时使用)，释放指定lock object上的所有locks，生成调试信息
+// 等功能
+int __lock_vec(ENV *env, DB_LOCKER *sh_locker, u_int32_t flags, DB_LOCKREQ *list, int nlist, DB_LOCKREQ **elistp)
+
+	LOCK_SYSTEM_LOCK
+
+	对于list中的每个lock请求，判断lock请求的操作(switch (list[i].op)):
+		如果是DB_LOCK_GET_TIMEOUT，则在flags参数上设置DB_LOCK_SET_TIMEOUT，并fall through到下一步
+
+		如果是DB_LOCK_GET，则调用__lock_get_internal函数获取指定的lock
+
+		如果是DB_LOCK_INHERIT，则调用__lock_inherit_locks函数合并子事务的locks到父事务中
+
+		如果是DB_LOCK_PUT，则调用__lock_put_nolock函数释放lock
+
+		如果是DB_LOCK_PUT_ALL  	/* Put all locks */
+			  DB_LOCK_PUT_READ	/* Put read locks */
+			  DB_LOCK_UPGRADE_WRITE	/* Upgrade was_write and put read locks */
+			  遍历locker的heldby list，将需要put的lock从list中去除，然后更新相关字段(nlocks, nwrites)，再调用__lock_put_internal
+			  函数释放lock(调用时没有指定DB_LOCK_UNLINK)，被去除的locks对应的lock object都会放到list[i].obj字段中
+			  如果这时list[i].obj不为空，则调用__lock_fix_list函数进行合并
+			  /* 为了abort一个支持脏读的事务，需要将所有的WWRITE locks提升到WRITE locks??? */
+			  如果op是DB_LOCK_UPGRADE_WRITE并且sh_locker设置了DB_LOCKER_DIRTY标志，则遍历sh_locker的heldby list，
+			  为sh_locker设置DB_LOCKER_INABORT标志，然后调用__lock_get_internal函数进行提升操作
+			
+		如果是DB_LOCK_PUT_OBJ，则遍历lock object的waiter/holder list并调用__lock_put_internal函数释放lock				  
+
+		如果是DB_LOCK_TIMEOUT，则调用__lock_set_timeout_internal的DB_SET_TXN_NOW功能
+
+		如果是DB_LOCK_TRADE，则调用__lock_trade函数
+
+	LOCK_SYSTEM_UNLOCK
+
+	如果判断需要运行deadlock detector，则调用__lock_detect函数运行
+
+
+lock_failchk.c --------------------------------------------------------------------------------------------------
+// 检查已死亡的线程所拥有的locks，并且释放read locks。如果已死亡的非事务locker拥有write locks，则
+// 我们必须abort并且运行recovery。否则，我们释放属于已死亡线程的lockers所拥有的read locks。已死亡的事务locker
+// 所拥有的write locks将在我们abort该事务的时候释放。
+// 该函数会被__env_failchk_int函数调用
+int __lock_failchk(ENV *env)
+
+	LOCK_LOCKERS
+
+	对于lock region的locker hash table中的每个locker，执行以下操作:
+
+		如果一个事务locker，它的heldby list为空或者它拥有的都是write locks(lip->nlocks == lip->nwrites)，则
+		忽略该locker，并继续下一个(continue)
+
+
+		如果一个locker仍然处于活跃状态(dbenv->is_alive)，则继续下一个
+
+		/* 如果一个非事务locker拥有了write locks，我们必须假设一个berkeley db操作被中断了，而且只有1~N个页面被修改，
+		 * 这时会报2052错误
+		 */
+
+		/* 丢弃该locker和它的read locks */
+		调用__lock_vec，设置op为DB_LOCK_PUT_READ，以释放所有的read locks
+
+		/* 该locker很可能是被一个已死亡线程的游标所引用。通常来说该游标也可以被其它线程所访问到，但在这里我们假设
+		 * 该已死亡线程永远都不会释放它
+		 */
+		// 非事务的locker只拥有read locks的情况...
+		如果该locker为非事务的，则调用__lock_freelocker函数释放该locker
+
+
+lock_deadlock.c -------------------------------------------------------------------------------------------------
+
+// 生成lock依赖位图
+// 同步使用注意事项:
+//    LOCK_SYSTEM_LOCK  当只有一个lock partition时用于对lock objects的访问同步
+//    LOCK_LOCKERS      在遍历lockers list，或者使用lockerp->dd_id时使用
+//    LOCK_DD           保护dd list of objects(DB_LOCKREGION.dd_objs)
+static int __dd_build(ENV *env, u_int32_t atype, u_int32_t **bmp, u_int32_t *nlockers, u_int32_t *allocp, 
+	locker_info **idmap, int *rejectp, int *pri_set)
+
+	DB_LOCKTAB *lt = env->lk_handle;
+	DB_LOCKREGION *region = lt->reginfo.primary;
+
+	/*
+	 * 如果该函数被调用时atype指定了DB_LOCK_EXPIRE标志，则只会检查超时的情况，也不会去生成
+	 * conflict array
+	 */
+	
+	如果atype等于DB_LOCK_EXPIRE，则对于region->dd_objs中的每个lock object，遍历该object的waiter list，
+	如果某个lock的状态为DB_LSTAT_WAITING，如果其对应locker的lk_expire已经超时，则将该lock的状态设为
+	DB_LSTAT_EXPIRED，并调用MUTEX_UNLOCK，让阻塞在该lock上的进程/线程能够释放它。否则，如果设置了lk_expire
+	并且它比局部变量min_timeout小，则将min_timeout设置为lockerp->lk_expire。
+	以上工作完成之后直接返回。
+
+	分配三块空间: 第一块用于存放bitmap，第二块用于存放tmpmap，第三块用于存放lockers信息(struct locker_info)
+
+	遍历region->lockers list，为每个locker顺序赋予一个deadlock detector id(从0开始，递增)
+
+	/*
+	 * 因为只需要检查拥有waiters的lock objects，因此我们使用拥有waiters的lock object list(dd_objs)，来代替
+	 * 遍历lock object hash table。对于每个object，我们遍历它的waiters list，并且为每一对waiter/holder组合
+	 * 将它们添加到waitsfor矩阵中。由于我们不想获取DD mutex之后再获取hash mutex，因此我们先释放dd mutex再
+	 * 获取hash mutex，然后检查是否该对象已经改变。一旦我们锁定了object，则其它人无法去除该对象上的lock，也
+	 * 就意味着对应的locker不会无故消失。
+	 */
+	对于region->dd_objs中的每个object:
+
+		/* 首先，创建一个位图(tmpmap)，表示所有该对象的holders (这里的holders是locker) */
+		对于其holder list中的每个lock，如果该lock的状态为DB_LSTAT_HELD，则在tmpmap设置对应于其locker->dd_id的
+		位
+
+		/* 
+		 * 然后，对于每一个waiter，我们将它在矩阵中的行设置为等于上一步生成的map
+		 * 在矩阵中，waiter用行表示，holder用列表示 (这里的waiter和holder都是locker)
+		 */
+		对于lock object的waiter list中的每个waiter，如果其状态为DB_LSTAT_WAITING，则判断是否已经超时，如果已超时，
+		则设置其状态为DB_LSTAT_EXPIRED，然后通过MUTEX_UNLOCK唤醒对应的进程/线程，同时，也会根据lk_expire的值设置
+		min_timeout局部变量。
+		如果这是第一个waiter，并且它对应的locker也在object的holder list中，则设置struct locker_info.self_wait为1，
+		并且清除该行(全设为0)。对于后面的waiter不会做如此处理。
+
+	/*
+	 * 现在，对于每个locker，记录它的last lock以及决定是否设置in abort状态
+	 */
+	如果该locker对应于一个master事务，则遍历它的child locker list(lokerp->child_locker)，对于第一个其heldby
+	list不为空的child locker，如果它设置了DB_LOCKER_INABORT标志，则设置对应struct locker_info.in_abort = 1。
+	如果该child locker的第一个heldby lock状态为DB_LSTAT_WAITING，则设置locker_info.last_locker_id = child->id，
+	并跳转到get_lock步骤
+
+	如果该locker的heldby list不为空，则设置locker_info.last_locker_id = lockerp->id。
+
+get_lock:
+    设置locker_info.last_lock为last locker所heldby的第一个lock，并设置locker_info的其它一些信息
+
+    如果当前locker设置了DB_LOCKER_INABORT标志，则设置对应locker_info.in_abort = 1
+
+    设置相关返回参数之后返回
+
+
+// 查找deadlock list
+static int __dd_find(ENV *env, u_int32_t *bmp, locker_info *idmap, u_int32_t nlockers, u_int32_t nalloc, u_int32_t ***deadp)
+
+	/*
+	 * 如果某个locker是死锁的一部分，那么就会有一条wait-for路径，从该locker出发可以到达该locker自己，也即是
+	 * 说该locker会wait-for自己(或者说形成一个环)。
+	 * 因此，我们检测的方法是: 对于每个locker，将它waits-for的lockers(ISSET_MAP[curr_locker_id][holder_locker_id])对应
+	 * 的行全部OR到该locker对应的行上，如果最终ISSET_MAP[curr_locker_id][curr_locker_id]，则表示形成了一个环，因此
+	 * 该locker应该属于死锁的一部分。
+	 * 例如有三个locker，用->符号表示waits-for。假设1->2, 2->3, 3->1，则初始matrix为[0, 1, 0], [0, 0, 1], [1, 0, 0]
+	 * 检查locker 1时，不会检测到死锁，matrix变为[0, 1, 1], [0, 0, 1], [1, 0, 0]
+	 * 检查locker 2时，也不会检测到死锁，matrix变为[0, 1, 1], [1, 0, 1], [1, 0, 0]
+	 * 检查locker 3时，会检测到死锁，因为这时locker 3对应的bit array会变为[1, 1, 1]
+	 */
+	对于bitmap中的每一行，判断是否该locker和其它的locker有死锁的情况，如果有，
+	则将该locker加入到dead list中，并且将参与到该死锁中的所有其它locker标记为invalid(不再检测这些lockers)
+
+	设置相关返回参数之后返回
+
+
+// abort a locker
+static int __dd_abort(ENV *env, locker_info *info, int *statusp)
+
+	DB_LOCKTAB *lt = env->lk_handle;
+	DB_LOCKREGION *region = lt->reginfo.primary;
+
+	/* 加锁以保证该locker不会在操作它的时候消失 */
+	LOCK_SYSTEM_LOCK
+	LOCK_LOCKERS
+
+	调用__lock_getlocker_int函数获取locker(对应于info->last_locker_id)指针，如果没有找到或者它已经处于aborting状态，
+	则直接返回
+
+	获取locker的heldby list中第一个lock指针(lockp)，如果heldby list为空(lockp == NULL)，则直接返回
+
+	如果lock不等于info->last_lock或者lock对应的object不等于infop->last_obj，或者lock的状态不等于DB_LSTAT_WAITING，
+	则表明locking系统已经改变过了，直接返回
+
+	设置lock的状态为DB_LSTAT_ABORTED，然后将它从对应object的waiter list中去除
+
+	如果在上述操作之后object的waiter list为空，则将它从region->dd_objs中去除，否则调用__lock_promote函数来推进其它的
+	lock
+
+	调用MUTEX_UNLOCK(env, lockp->mtx_lock)来唤醒该lock
+
+	UNLOCK_LOCKERS, LOCK_SYSTEM_UNLOCK，返回
+
+
+/*
+ *根据一个包含了死锁的位图，验证which参数中指定的事务是否实际处于死锁状态。如果是，则返回1，否则返回0
+ * deadmap  -- 标识死锁的位图数组
+ * tmpmap   -- 一个临时位图数组，在过程中可被修改
+ * origmap  -- dd_build阶段返回的初始位图的拷贝
+ * nlockers -- 实际lockers的数目
+ * nalloc   -- 为位图分配的数目 (>= nlockers)
+ * which    -- 需要验证的locker
+ */
+static int __dd_verify(locker_info *idmap, u_int32_t *deadmap, u_int32_t *tmpmap, u_int32_t *origmap, 
+	u_int32_t nlockers, u_int32_t nalloc, u_int32_t which)
+
+	/*
+	 * 如果which指定的locker真正的包含于一个死锁中，那么将它去除之后应该能够解决死锁。
+	 * 因此，我们将除了which之外的其它locker的行全部OR在一起，如果所有参与者的bit还是处于
+	 * 被SET状态，则该死锁仍然存在并且which并没有参与在其中。如果消除了死锁，则说明
+	 * which参与其中。
+	 */
+	对于每一个locker，如果该locker就是which或者!ISSET_MAP(deadmap, j)，则继续下一个。
+	否则，将该locker对应的bit数组OR到tmpmap中。
+
+	检查tmpmap，对于在deadmap中SET的lockers，如果某个locker在tmpmap中相应的位没有被SET，则返回1
+	否则返回0
+
+
+
+// ENV->lock_detect pre/post processing
+int __lock_detect_pp(DB_ENV *dbenv, u_int32_t flags, u_int32_t atype, int *rejectp)
+
+	ENV_ENTER
+
+	在REPLICATION_WRAP宏中包装对__lock_detect函数的调用
+
+
+// ENV->lock_detect
+// 实际的deadlock detect函数
+int __lock_detect(ENV *env, u_int32_t atype, int *rejectp)
+
+	如果当前环境是一个replication client，则设置atype为DB_LOCK_MINWRITE(选择拥有最少write locks的那个locker)
+
+	如果region->need_dd为0，并且lock region没有设置next_timeout或当前还没有超时，则直接返回
+
+	如果region->need_dd为0，则设置atype为DB_LOCK_EXPIRE(仅处理超时的locks，不进行deadlock detect)
+
+	设置region->need_dd = 0，表示已经运行过deadlock detector
+
+	调用__dd_build函数生成waits-for位图 (其中的元素为locker, waiter为行，holder为列)
+
+	调用__dd_find函数查找死锁
+
+	/*
+	 * 我们同时也需要txn region的cur_maxid(当前最大空闲ID)。为了避免lock region和txn region之间微妙的
+	 * 同步，我们简单地首先unlock lock region，然后lock txn region。这会产生一个小的窗口，在这期间事务
+	 * 系统可能会改变lock region的状态。在这种不太可能的情况下，返回关于"oldest"或"youngest"的错误答案
+	 * 是我们能预见到的，也是愿意的
+	 */
+    如果环境支持事务(TXN_ON(env))，则TXN_SYSTEM_LOCK，获取cur_maxid到txn_max局部变量，TXN_SYSTEM_UNLOCK。
+    否则，txn_max设置为TXN_MAXIMUM。
+
+    对于deadlist中的每个元素outer_dd_id，执行以下操作:
+
+    	/*
+    	 * 我们的算法会有失败的时候。验证函数返回1表示该locker不仅包含在一个死锁中，而且杀死它可以使得其它的
+    	 * locker向前推进。但不幸的是，某些情况下虽然我们abort了某个事务，但是不一定能够保证整体过程可以向前
+   		 * 推进(想象有N个读者同时尝试获取一个write lock)。
+    	 * 局部变量killid仅设置为通过db_verify测试的locker。而局部变量keeper将设置为最好的候选locker，即使它
+    	 * 没有通过db_verify测试。一旦我们设置了killid，则不再需要keeper，但无论如何我们还是会更新它。
+    	 */
+    	如果killid对应的locker_info设置了in_abort，或者没有通过__dd_verify测试(返回0)，则将killid设置为BAD_KILLID。
+
+    	如果atype参数为DB_LOCK_DEFAULT或DB_LOCK_RANDOM，并且killid有效，则直接跳转到dokill
+
+    	/*
+    	 * 从一个包含于在死锁中的id开始，我们检查所有其它的位，以确定是否会有真正属于死锁的，更好的候选者
+    	 * 来abort
+    	 * "best"的定义:
+    	 * MAXLOCKS: maximum count
+    	 * MAXWRITE: maximum write count
+    	 * MINLOCKS: minimum count
+    	 * MINWRITE: minimum write count
+    	 * OLDEST: samllest id
+    	 * YOUNGEST: largest id
+    	 */
+    	从当前的outer_dd_id开始，对于所有lockers的inner_dd_id，执行以下操作:
+
+    		如果bitmap中设置了bmp[outer_dd_id][inner_dd_id]，并且inner_dd_id对应的locker没有abort，则根据两个
+    		locker的priority，以及atype参数判断新的locker是否是一个更好的候选。如果是一个更好的候选，将keeper
+    		设置为新的locker。同时，调用__dd_verify函数来测试新的locker，如果它通过了，则将killid也设为它的inner_dd_id。
+
+dokill:
+	如果killid为BAD_KILLID，并且keeper不等于BAD_KILLID，则设置killid = keeper，并且设置region->need_dd = 1(这表明我们
+	将abort keeper，但是这还不足以打破死锁，因此设置需要重新运行dd的标志)。如果keeper也为BAD_KILLID，则直接返回。
+
+	调用__dd_abort函数kill掉killid对应的locker
+
+
+
+
+
+
+
+
+
+	    
+
+
+
+
+
+
+		 
+
+
+
+
+
+
+
 
 
