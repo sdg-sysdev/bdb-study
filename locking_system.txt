@@ -971,8 +971,9 @@ static int __dd_abort(ENV *env, locker_info *info, int *statusp)
 
 
 /*
- *根据一个包含了死锁的位图，验证which参数中指定的事务是否实际处于死锁状态。如果是，则返回1，否则返回0
- * deadmap  -- 标识死锁的位图数组
+ * 根据一个包含了死锁的位图，验证which参数中指定的事务是否实际处于死锁状态。如果是，则返回1，否则返回0
+ * deadmap  -- 标识死锁的位图数组，该数组是由__dd_find函数返回的，根据代码，
+               该map中至少包含了组成一个死锁的所有节点
  * tmpmap   -- 一个临时位图数组，在过程中可被修改
  * origmap  -- dd_build阶段返回的初始位图的拷贝
  * nlockers -- 实际lockers的数目
@@ -984,9 +985,12 @@ static int __dd_verify(locker_info *idmap, u_int32_t *deadmap, u_int32_t *tmpmap
 
 	/*
 	 * 如果which指定的locker真正的包含于一个死锁中，那么将它去除之后应该能够解决死锁。
-	 * 因此，我们将除了which之外的其它locker的行全部OR在一起，如果所有参与者的bit还是处于
-	 * 被SET状态，则该死锁仍然存在并且which并没有参与在其中。如果消除了死锁，则说明
-	 * which参与其中。
+	 * 因此，我们将除了which之外的其它被which waits-for的locker的对应的行全部OR在一起，
+	 * 如果所有参与者的bit还是处于被SET状态，则该死锁仍然存在并且which并没有参与在其中。
+	 * 如果消除了死锁，则说明which参与其中。
+	 * 对于死锁，其中所有节点的waits-for集合应该包含了该死锁中的所有节点。因此，如果上面的条件
+	 * 满足，表明去掉了该locker之后，其它节点的waits-for lockers不再包含所有节点，因此解决了
+	 * 死锁
 	 */
 	对于每一个locker，如果该locker就是which或者!ISSET_MAP(deadmap, j)，则继续下一个。
 	否则，将该locker对应的bit数组OR到tmpmap中。
@@ -1064,29 +1068,3 @@ dokill:
 	将abort keeper，但是这还不足以打破死锁，因此设置需要重新运行dd的标志)。如果keeper也为BAD_KILLID，则直接返回。
 
 	调用__dd_abort函数kill掉killid对应的locker
-
-
-
-
-
-
-
-
-
-	    
-
-
-
-
-
-
-		 
-
-
-
-
-
-
-
-
-
