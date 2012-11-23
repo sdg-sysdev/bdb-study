@@ -1,0 +1,141 @@
+1. 相关数据结构和关联
+
+a) DB_ENV/struct __db_env:
+    用户可见的数据库环境，包含用户相关/可见信息。
+
+    ENV *env;	// 内部数据库环境
+
+
+b) ENV/struct __env:
+    内部数据库环境，包含内部数据库的相关信息
+
+    DB_ENV *dbenv;	// 外部数据库环境
+    db_mutex_t mtx_env; // 同步对该结构的并发访问
+    DB_LOCKTAB *lt_handle;  // lock子系统句柄
+
+
+c) DB_LOCKTAB/struct __db_locktab:
+    lock子系统句柄，通过它可以获得其它信息
+
+    ENV *env;
+    REGINFO reginfo;    // lock区域信息
+    u_int8_t *conflicts;    // 冲突矩阵指针
+    DB_LOCKPART *part_array;    // lock分区信息
+    DB_HASHTAB *obj_tab;    // 目标对象哈希表
+    DB_HASHTAB *locker_tab; // 加锁者对象哈希表
+
+
+d) DB_LOCKREGION/struct __db_lockregion
+    lock子系统区域信息，每个环境只有一个lock区域。
+    可以通过DB_LOCKTAB.reginfo.primary访问到。
+
+    db_mutex_t mtx_region;  // 同步对该结构的并发访问
+    db_mutex_t mtx_lockers; // 保护加锁者对象的分配
+    SH_TAILQ_HEAD(__dobj) dd_objs;  // 需要参与到死锁检测中的目标对象列表
+    SH_TAILQ_HEAD(__flocker) free_lockers;  // 空闲的加锁者对象列表
+    SH_TAILQ_HEAD(__lkrs) lockers;  // 加锁者对象列表
+
+
+e) DB_LOCKPART/struct __db_lockpart
+    lock分区。在一个lock区域中会有一个或多个分区。分区的作用主要是为了增加
+    并发性。通过DB_LOCKTAB.part_array访问该结构。
+
+    db_mutex_t	mtx_part;  // 同步对该结构的并发访问
+    SH_TAILQ_HEAD(__flock) free_locks;  // 空闲锁列表
+    SH_TAILQ_HEAD(__fobj) free_objs;  // 空闲目标对象列表
+
+
+f) DB_LOCKER/struct __db_locker
+    加锁者信息。在事务环境下，一个加锁者对应到一个事务。
+    
+    u_int32_t id;    // id号，0(DB_LOCK_INVALIDID)表示非法id号。
+                     // 整个id空间被分为两段:
+                     // 1 ~ DB_LOCK_MAXID(0x7fffffff)用于非事务环境
+                     // DB_LOCK_MAXID ~ TXN_MAXIMUM(0xffffffff)用于事务环境
+    db_mutex_t mtx_locker;  // 用于让该加锁者拥有的锁阻塞
+    roff_t master_locker;  // 根事务所对应的加锁者
+    roff_t parent_locker;  // 父事务所对应的加锁者
+    SH_LIST_HEAD(_child) child_locker;  // 后辈事务列表，仅用于根事务。
+    SH_LIST_ENTRY child_link;  // child_locker列表的entry link
+
+    SH_TAILQ_ENTRY links;  // 空闲列表(DB_LOCKREGION.free_lockers)或者
+                           // 哈希表(DB_LOCKTAB.locker_tab)的entry link
+    SH_TAILQ_ENTRY ulinks; // 使用中列表(DB_LOCKREGION.lockers)的entry link
+    SH_LIST_HEAD(_held) heldby;  // 该加锁者所拥有的锁列表
+
+    u_int32_t flags;  // 状态/标记指示
+
+
+g) struct __db_lock
+    针对于目标对象的锁。
+
+    db_mutex_t	mtx_lock;  // 用于阻塞拥有该锁的进程/线程。会设为DB_LOCKER.mtx_locker
+    roff_t holder;	   // 拥有该锁的加锁者
+    SH_TAILQ_ENTRY links;  // 空闲列表(DB_LOCKPART.free_locks)或holder列表(DB_LOCKOBJ.holders)
+                           // 或waiter列表(DB_LOCKOBJ.waiters)的entry link
+    SH_LIST_ENTRY locker_links;  // 加锁者拥有的锁列表(DB_LOCKER.heldby)的entry link
+    u_int32_t refcount;    // 引用计数
+    db_lockmode_t mode;    // 模式，S/X/IS/IX/SIX/...
+    roff_t obj;		   // 目标对象的相对偏移
+    db_status_t status;    // 状态 DB_LSTAT_ABORTED...等
+
+
+h) DB_LOCKOBJ/struct __db_lockobj
+    加锁的目标对象。存在于对象哈希表中(DB_LOCKTAB.obj_tab)。
+
+    u_int32_t indx;  // 该对象的哈希索引号
+    SH_DBT lockobj;    // 标识实际的对象属性。一般是struct __db_ilock结构
+    SH_TAILQ_ENTRY dd_links;  // 死锁检测对象列表(DB_LOCKREGION.dd_objs)的entry link
+    SH_TAILQ_HEAD(__waitl) waiters;  // 等待于该对象之上的锁列表
+    SH_TAILQ_HEAD(__holdl) holders;  // 获取了该对象的锁列表
+
+    u_int8_t objdata[sizeof(struct __db_ilock)];  // 由于实际对象属性一般都为struct __db_ilock结构，
+                      // 因此在这儿预分配空间，而不用每次都要动态分配空间了
+                      // 一般情况下，lockobj.data = objdata
+
+
+i) DB_LOCK_ILOCK/struct __db_ilock
+    表示数据库中被锁定对象的属性。由于BDB实现的是页级锁，因此该结构中
+    定义的是页面的标识。
+
+    db_pgno_t pgno;    // 页号
+    u_int8_t fileid[DB_FILE_ID_LEN];  // 文件ID号。DB_FILE_ID_LEN定义为20
+
+    u_int32_t type;  // 锁的类型。 DB_HANDLE_LOCK/DB_RECORD_LOCK/...
+
+
+j) DB_LOCK/struct __db_lock_u
+    在lock_get(或者lock_vec/DB_LOCK_GET)请求时由调用者分配并填充。
+
+    roff_t off;  // 对应的锁在区域中的偏移
+    u_int32_t ndx;  // 该锁目标对象的索引号
+    u_int32_t gen;  // 锁的代数
+    db_lockmode_t mode;  // 锁的模式
+
+
+
+
+2. 一些用于保护数据结构并发访问的宏
+
+a) LOCK_SYSTEM_LOCK/LOCK_SYSTEM_UNLOCK
+    当区域的分区数为1时，该宏会获取/释放区域的MUTEX，如果大于1，则该宏为NOOP。
+    在只有一个分区时，用于对目标对象哈希表访问的保护(以及和对象关联的锁)
+
+b) MUTEX_LOCK_PARTITION/MUTEX_UNLOCK_PARTITION
+    在区域分区数大于1时，该宏会获取/释放指定分区的MUTEX，如果只有一个分区，则
+    该宏为NOOP。在多于一个分区时，用于对属于该分区的目标对象访问的保护(以及和
+    对象关联的锁)
+
+c) OBJECT_LOCK/OBJECT_LOCK_NDX/OBJECT_UNLOCK
+    该宏用于获取/释放目标对象哈希表中指定对象所在的桶。最终实际上锁定的是
+    该桶所对应的分区。计算某个桶属于哪个分区很简单，直接是用桶的索引号模分区数。
+
+    
+
+
+
+    
+
+
+
+
