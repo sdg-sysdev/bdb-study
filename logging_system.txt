@@ -1,0 +1,124 @@
+DB_LOG  对应于 DB_LOCKTAB
+LOG     对应于 DB_LOCKREGION
+
+log.c ---------------------------------------------------------------------------------------------------------
+// 在共享内存中初始化一个log region
+static int __log_init(ENV *env, DB_LOG *dblp)
+
+	调用__log_check_sizes检查配置是否正确
+
+	调用__env_alloc分配共享的日志region (sizeof(LOG))
+
+	初始化日志region的各个字段 (LOG/struct __log)
+
+	设置 env->lg_handle = dblp;
+
+	调用__log_set_config_int函数设置DB_LOG的flags标志
+
+
+
+
+// Internal version of log_open: 
+//   only called from ENV->open.
+int __log_open(ENV *env)
+
+	为DB_LOG分配内存
+
+	加入/创建共享的log region(__env_region_share, __log_init)
+
+	设置环境的日志句柄为已经初始化的日志子系统数据结构(env->lg_handle = dblp)
+
+	如果该log region是新创建的(F_ISSET(&dblp->reginfo, REGION_CREATE)) : 
+
+
+		调用__log_recover函数尝试恢复(可能)崩溃之前的日志
+
+		如果没有设置下一个日志文件的长度，则设置它为当前日志文件的长度
+
+		如果当前还没有写入任何日志，则调用__log_newfile函数切换到一个新的日志文件
+
+		初始化replication所需要的next-expected LSN和bulk buffer。在__env_open中，总是
+		在log region之前先创建/打开replication region，因此如果使用到replication，则
+		在这儿rep_handle肯定是可用的。
+
+	否则
+		
+		根据当前环境设置的日志文件长度，设置log region的下一个日志文件长度(lp->log_nsize = dbenv->lg_size)。
+
+		调用__log_set_config_int函数设置DB_LOG的flags标志
+
+
+
+
+
+log_method.c --------------------------------------------------------------------------------------------------
+// 确认日志文件长度和日志缓冲区长度兼容
+int __log_check_sizes(ENV *env, u_int32_t lg_max, u_int32_t lg_bsize)
+
+    检查在配置了in-memory日志的情况下，是否lg_max小于或等于lg_bsize
+
+// 配置日志子系统对应数据结构DB_LOG的flags字段
+int __log_set_config_int(DB_ENV *dbenv, u_int32_t flags, int on, int in_open)
+
+	合法性检查，例如设置的标志是否在几个合法的标志集合中等
+
+	如果开启了LOGGING（LOGGING_ON(env))，则调用__log_set_flags函数设置LOG.db_log_autoremove
+	和LOG.db_log_inmemory。然后调用__env_map_flags生成对应的DB_LOG标志并设置
+
+
+log_put.c -----------------------------------------------------------------------------------------------------
+// 初始化并切换到一个新的日志文件。(在还没有日志存在时或填满了一个日志文件时被调用)
+int __log_newfile(DB_LOG *dblp, DB_LSN *lsnp, u_int32_t logfile, u_int32_t version)
+
+	如果logfile参数没有指定一个特定的日志文件，并且当前不在日志文件头(logfile == 0 && lp->lsn.offset != 0)，
+
+		调用__log_flush_int函数flush当前日志文件到磁盘。
+		/* 
+		 * 在这里我们还不能释放log region mutex，因为在切换的时候需要保护当前文件的末尾。尤其可能的是，
+		 * 一个拥有更小记录的线程可能会检测到当前日志文件末尾还有足够的空间。即使通过标记当前文件已经满了来
+		 * 阻止这种情况的发生，但所有线程还是必须等在这儿，等待flush完成之后lsn.file向前移动。如果针对之前的
+		 * 日志文件和当前日志文件各有一个lsn，则可能可以避免这种情况，但这么做也不太可能增加很多吞吐量。
+		 */
+
+	 	将lsn中的偏移量保存到lastoff局部变量中，该值将被用于初始化persistent header信息。
+
+	 	++lp->lsn.file;  lp->lsn.offset = 0;		// 实际切换日志文件
+
+	 	设置写的偏移量为0(lp->w_off = 0)。
+
+	否则，设置lastoff = 0
+
+	/*
+	 * replication可能需要我们重置整个日志文件命名空间
+	 * 在这种情况下，我们也会强制进行日志文件切换，使得replication可以清理旧的日志文件
+	 */
+	如果logfile != 0，则lp->lsn.file = logfile; lp->lsn.offset = 0; 如果是内存日志，则调用__log_zero 
+	清空日志，否则设置lp->s_lsn = lp->lsn，然后调用__log_newfh函数获取新日志文件的句柄
+
+	如果是内存日志(lp->db_log_inmemory)，则调用__log_inmem_newfile函数在内存缓冲区中记录新文件的起始偏移???
+
+	/*
+	 * 作为每个日志文件的第一条记录，插入persistent信息。
+	 * 注意对于日志中的第一条记录，之前的长度是错误的。但是这没关系，在获取的时候我们会进行检查。
+	 */
+	 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
