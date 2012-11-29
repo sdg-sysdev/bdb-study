@@ -158,3 +158,36 @@ static int __log_fill(DB_LOG *dblp, DB_LSN *lsn, void *addr, u_int32_t len)
 
 	如果是内存log，则调用__log_inmem_copyin复制数据，更新lp->b_off之后返回
 
+	当 len > 0时
+
+		/*
+		 * 如果我们正开始一个新的缓冲区，则记录该缓冲区第一个字节对应的LSN。
+		 * 在flush缓冲区的时候需要通过它来判断是否需要flush内存缓冲区。
+		 */
+		如果当前是缓冲区的起始位置，则将当前LSN的值赋予f_lsn (lp->f_lsn = *lsn)。
+
+		如果当前是缓冲区的起始位置，并且数据长度大于等于缓冲区长度，则调用__log_write
+		先将尽量多的数据写入磁盘(size:  (len / bsize) * bsize)，然后跳转到循环开头
+		继续执行
+
+		将尽可能多的数据copy到缓冲区
+
+		如果缓冲区满了，则调用__log_write写数据到磁盘
+
+
+static int __log_write(DB_LOG *dblp, void *addr, u_int32_t len)
+
+	LOG *lp = dblp->reginfo.primary;
+
+	如果还没有打开过日志文件(dblp->lfhp == NULL)，
+	或者已经改变了当前文件(dblp->lfname != lp->lsn.file || dblp->lf_timestamp != lp->timestamp)，
+	则获取一个新的日志文件(__log_newfh)。
+
+	如果是从文件的开始位置写，则调用__db_file_extend为日志文件预先分配空间，这么做能够增加fsync
+	的性能。如果dblp设置了DBLOG_ZERO标志，则调用__db_zero_extend填充0。
+
+	调用__os_io函数在文件的指定位置(lp->w_off)写入数据
+
+	更新下一次写入位置(lp->w_off += len)
+
+	更新统计信息并返回
