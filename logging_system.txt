@@ -17,7 +17,6 @@ static int __log_init(ENV *env, DB_LOG *dblp)
 
 
 
-
 // Internal version of log_open: 
 //   only called from ENV->open.
 int __log_open(ENV *env)
@@ -46,6 +45,13 @@ int __log_open(ENV *env)
 		根据当前环境设置的日志文件长度，设置log region的下一个日志文件长度(lp->log_nsize = dbenv->lg_size)。
 
 		调用__log_set_config_int函数设置DB_LOG的flags标志
+
+
+// 设置LOG.persist.version为指定的newver
+// 在region初始创建，replication启动，以及发现一个新的master时被调用
+void __log_set_version(ENV *env, u_int32_t newver)
+
+
 
 
 
@@ -101,24 +107,54 @@ int __log_newfile(DB_LOG *dblp, DB_LSN *lsnp, u_int32_t logfile, u_int32_t versi
 	 * 作为每个日志文件的第一条记录，插入persistent信息。
 	 * 注意对于日志中的第一条记录，之前的长度是错误的。但是这没关系，在获取的时候我们会进行检查。
 	 */
-	 
+	如果version参数不为0，则调用__log_set_version设置共享region中的log版本号，之后调用__env_init_rec初始化
+	recovery相关的信息
+
+	如果环境没有设置ENV_LITTLEENDIAN标志(BDB默认使用little endian格式记录日志内容)，则调用__log_persistswap
+	函数将log file persistent header中的字段转换为big endian格式
+
+	调用__log_encrypt_record对persistent header进行加密
+
+	调用__log_putr函数写入persistent header
+
+	如果lsnp参数不为null，则将更新过的lsn更新到lsnp中
 
 
 
+static int __log_putr(DB_LOG *dblp, DB_LSN *lsn, const DBT *dbt, u_int32_t prev, HDR *h)
+
+	设置hdr本地变量为指定的h，或初始化一个本地的HDR(in case h == null)
+
+	保存当前位置(lp->b_off, lp->w_off, lp->f_lsn)
+
+	初始化hdr的prev和len字段 (hdr->prev = prev; hdr->len = (u_int32_t)hdr->size + dbt->size;)
+
+	/*
+	 * 如果传进来的checksum字段非0，则表明调用者在获取log mutex之前已经计算了正确的checksum，
+	 * 作为一个优化的手段
+	 * 但如果调用者计算的checksum正好等于0，那事实上我们也不需要做任何事情...
+	 */
+	如果hdr->checksum[0] == 0，则调用__db_chksum计算校验码，否则调用LOG_HDR_SUM重新计算校验码
+	(将hdr->prev和hdr->len考虑进去，因为在调用者计算的时候这两者都还为0)
+
+	/*
+	 * 这时，日志文件的当前偏移就是我们将要写入该记录的LSN，也是调用者所想要的LSN
+	 */
+	设置lsn参数为当前lsn (*lsn = lp->lsn)
+
+	如果LOG_SWAPPED(env)，则调用__log_hdrswap函数swap hdr
+
+	调用__log_fill函数写hdr
+
+	调用__log_file函数写record (dbt->data, dbt->size)
+
+	更新lp->len = (u_int32_t)(hdr->size + dbt->size); 以及lp->lsn.offset += lp->len;
 
 
+// 将指定的数据写入日志文件
+static int __log_fill(DB_LOG *dblp, DB_LSN *lsn, void *addr, u_int32_t len)
 
+	LOG *lp = dblp->reginfo.primary;
 
-
-
-
-
-
-
-
-
-
-
-
-
+	如果是内存log，则调用__log_inmem_copyin复制数据，更新lp->b_off之后返回
 
