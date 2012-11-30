@@ -1,6 +1,18 @@
 DB_LOG  对应于 DB_LOCKTAB
 LOG     对应于 DB_LOCKREGION
 
+HDR是不被加密的，只有log record可能被加密
+每个log record之前都会有一个HDR
+每个log file的第一个log record是LOGP/struct __log_persist结构
+
+|------------|--------------------|----------------|------------------------------------|
+     HDR            DB_MAC_KEY      IV(DB_IV_BYTES)        RECORD (encrypted or not)
+
+
+HDR(non-crypted):  prev(4 bytes) + len(4 bytes) + chksum(4 bytes)
+HDR(crypted): prev + len + chksum + iv + orig_size
+
+
 log.c ---------------------------------------------------------------------------------------------------------
 // 在共享内存中初始化一个log region
 static int __log_init(ENV *env, DB_LOG *dblp)
@@ -50,6 +62,34 @@ int __log_open(ENV *env)
 // 设置LOG.persist.version为指定的newver
 // 在region初始创建，replication启动，以及发现一个新的master时被调用
 void __log_set_version(ENV *env, u_int32_t newver)
+
+
+// 验证一个日志文件。在statusp参数中返回结果码 DB_LV_INCOMPLETE/DB_LV_NONEXISTENT/...
+int __log_valid(DB_LOG *dblp, u_int32_t number, int set_persist, DB_FH **fhpp, 
+		u_int32_t flags, logfile_validity *statusp, u_int32_t versionp)
+
+	调用__log_name函数获取文件路径并打开它
+	
+	调用__os_read读取日志文件的第一条persistent hdr记录(with HDR ahead)，如果没有读取到足够的
+	字节数，则返回DB_LV_INCOMPLETE，否则报错(__db_err)后退出
+
+	如果LOG_SWAPPED(env)，调用__log_hdrswap将数据转换为host表示
+
+	/*
+	 * 现在，需要验证persistent record了。我们必须处理以下情况
+	 * 1. 用户开启了加密:
+	 *    正在读取一个旧版本的，未加密的日志文件  - 在比较记录长度时失败
+	 *    正在读取一个当前版本的，未加密的日志文件 - 在比较记录长度时失败
+	 *    正在读取一个旧版本的，加密的日志文件  - 解密之后，在版本比对时失败
+	 *    正在读取一个当前版本的，加密的文件  - 正常
+	 * 2. 用户关闭了加密
+	 *    正在读取一个旧版本的，未加密的日志文件  - 版本比对时失败
+	 *    正在读取一个当前版本的，未加密的日志文件 - 正常
+	 *    正在读取一个旧版本的，加密的日志文件  - 比对magic number时失败(因为是已加密的)
+	 *    正在读取一个当前版本的，加密的文件  - 比对magic number时失败(因为是已加密的)
+	 */
+
+
 
 
 
@@ -191,3 +231,15 @@ static int __log_write(DB_LOG *dblp, void *addr, u_int32_t len)
 	更新下一次写入位置(lp->w_off += len)
 
 	更新统计信息并返回
+
+
+// 为当前日志文件获取一个文件句柄
+static int __log_newfh(DB_LOG *dblp, int create)
+
+	LOG *lp = dblp->reginfo.primary;
+
+	如果之前的句柄没有关闭，则调用__os_closehandle关闭之
+
+	调用__log_valid函数获取日志文件路径并打开它
+
+
